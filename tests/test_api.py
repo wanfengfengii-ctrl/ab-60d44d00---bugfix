@@ -185,3 +185,120 @@ def test_concurrent_items_and_seal(client, tmp_path):
     m2 = store.seal(sid)
     assert m1 == m2 and m1["state"] == "sealed"
     assert m1["counts"]["certificates"] == 3
+
+
+def test_two_instances_race_same_request_id(tmp_path):
+    """Two API instances sharing one volume: concurrent requests carrying the
+    same client_request_id settle on a single persisted result — identical
+    content gets one replayed response, different content conflicts before
+    any domain write."""
+    import sqlite3
+    import threading
+    root_dir = str(tmp_path / "shared")
+    c1 = TestClient(create_app(Store(root_dir)))
+    c2 = TestClient(create_app(Store(root_dir)))
+
+    def race(fn1, fn2):
+        out = []
+        t1 = threading.Thread(target=lambda: out.append(fn1(c1)))
+        t2 = threading.Thread(target=lambda: out.append(fn2(c2)))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        return out
+
+    def count(table):
+        conn = sqlite3.connect(os.path.join(root_dir, "app.db"))
+        try:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+
+    # -- create entry: same id, different normalized content --------------
+    rs = race(lambda c: c.post("/api/v1/evidence-sets",
+                               json={"client_request_id": "race-create",
+                                     "note": "a"}),
+              lambda c: c.post("/api/v1/evidence-sets",
+                               json={"client_request_id": "race-create",
+                                     "note": "b"}))
+    assert sorted(r.status_code for r in rs) == [201, 409]
+    sid = next(r.json()["evidence_set_id"] for r in rs if r.status_code == 201)
+    assert count("sets") == 1  # the loser created no evidence set
+
+    # -- create entry: same id, identical content -> unique replay ---------
+    rs = race(*[lambda c: c.post("/api/v1/evidence-sets",
+                                 json={"client_request_id": "race-create2",
+                                       "note": "same"})] * 2)
+    assert [r.status_code for r in rs] == [201, 201]
+    assert len({r.json()["evidence_set_id"] for r in rs}) == 1
+    assert len({r.content for r in rs}) == 1  # byte-identical replay
+    assert count("sets") == 2
+
+    # -- upload entry: same id, different content -> conflict, no upload ---
+    rk, ck, lk, root, ca, leaf = _pki()
+    root2 = pf.build_cert("R2", None, rk, rk, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        self_signed=True)
+
+    def item(ref, obj):
+        return {"client_ref": ref, "type": "certificate",
+                "content_base64": base64.b64encode(pf.der(obj)).decode()}
+
+    # Seed the anchor deterministically so adjudication below always has it.
+    r = c1.post(f"/api/v1/evidence-sets/{sid}/items",
+                json={"client_request_id": "seed-items", "received_at": RECEIVED,
+                      "items": [item("root", root)]})
+    assert r.status_code == 200
+    assert count("items") == 1
+
+    rs = race(lambda c: c.post(f"/api/v1/evidence-sets/{sid}/items",
+                               json={"client_request_id": "race-items",
+                                     "received_at": RECEIVED,
+                                     "items": [item("ca", ca)]}),
+              lambda c: c.post(f"/api/v1/evidence-sets/{sid}/items",
+                               json={"client_request_id": "race-items",
+                                     "received_at": RECEIVED,
+                                     "items": [item("root2", root2)]}))
+    assert sorted(r.status_code for r in rs) == [200, 409]
+    assert count("items") == 2  # only the winner's item was uploaded
+
+    # -- upload entry: identical content -> unique replay ------------------
+    rs = race(*[lambda c: c.post(f"/api/v1/evidence-sets/{sid}/items",
+                                 json={"client_request_id": "race-items2",
+                                       "received_at": RECEIVED,
+                                       "items": [item("leaf", leaf)]})] * 2)
+    assert [r.status_code for r in rs] == [200, 200]
+    assert len({r.content for r in rs}) == 1
+    assert count("items") == 3
+
+    r = c1.post(f"/api/v1/evidence-sets/{sid}/seal",
+                json={"client_request_id": "race-seal"})
+    assert r.status_code == 200
+
+    # -- adjudication entry: same id, different content -> conflict --------
+    def adj(rid, signed_at, artifact):
+        d = hashlib.sha256(artifact).digest()
+        s = lk.sign(d, ec.ECDSA(Prehashed(hashes.SHA256())))
+        return {"client_request_id": rid, "artifact_digest": d.hex(),
+                "signature": s.hex(),
+                "signature_algorithm": "1.2.840.10045.4.3.2",
+                "signed_at": signed_at, "knowledge_cutoff": CUTOFF,
+                "leaf_certificate_sha256": fp_of(pf.der(leaf)),
+                "initial_policies": [ANY],
+                "trust_anchors": [fp_of(pf.der(root))]}
+
+    rs = race(lambda c: c.post(f"/api/v1/evidence-sets/{sid}/adjudications",
+                               json=adj("race-adj", SIGNED, b"a1")),
+              lambda c: c.post(f"/api/v1/evidence-sets/{sid}/adjudications",
+                               json=adj("race-adj", SIGNED + 1, b"a1")))
+    assert sorted(r.status_code for r in rs) == [201, 409]
+    assert count("adjudications") == 1  # no second adjudication result
+
+    # -- adjudication entry: identical content -> unique replay ------------
+    # (distinct artifact so the content-addressed adjudication differs; the
+    # body is built once — ECDSA signatures are randomized per call)
+    adj2_body = adj("race-adj2", SIGNED, b"a2")
+    rs = race(*[lambda c: c.post(f"/api/v1/evidence-sets/{sid}/adjudications",
+                                 json=adj2_body)] * 2)
+    assert [r.status_code for r in rs] == [201, 201]
+    assert len({r.json()["adjudication_id"] for r in rs}) == 1
+    assert len({r.content for r in rs}) == 1
+    assert count("adjudications") == 2

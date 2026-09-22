@@ -3,7 +3,19 @@
 Two API instances may share one volume. All state transitions happen inside
 SQLite transactions (``BEGIN IMMEDIATE``) so concurrent uploads and racing
 seals produce one immutable manifest. Blobs are written temp-file + rename.
-The server clock is never used here; ``received_at`` is client supplied.
+The server clock never influences persisted results; ``received_at`` is
+client supplied and the clock is only used for idempotency claim leases.
+
+Idempotency is claim-first: a ``(scope, client_request_id)`` pair is
+atomically claimed (``BEGIN IMMEDIATE`` … ``INSERT``) *before* any domain
+write, so two instances racing with the same request id can never both
+enter the domain flow. A racing request whose normalized content differs
+fails with ``409`` before anything is written; one with identical content
+waits for the owner to finish and replays the stored response. Claims
+carry a lease so a crashed owner never blocks retries permanently — a
+later identical request takes the claim over and, because every domain
+operation is deterministic for identical normalized content, converges on
+the same single persisted result.
 """
 from __future__ import annotations
 
@@ -11,10 +23,18 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 
 from . import canonical
 from .errors import ConflictError, MalformedEvidenceError, NotFoundError
+
+# Idempotency claim tuning. The lease only gates crash recovery; it never
+# affects persisted results.
+IDEMPOTENCY_LEASE_SECONDS = 15.0
+IDEMPOTENCY_HEARTBEAT_SECONDS = 5.0
+IDEMPOTENCY_POLL_SECONDS = 0.05
+IDEMPOTENCY_MAX_WAIT_SECONDS = 1800.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sets (
@@ -41,6 +61,9 @@ CREATE TABLE IF NOT EXISTS idempotency (
     normalized_digest TEXT NOT NULL,
     status_code INTEGER NOT NULL,
     response_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'done',      -- pending | done
+    owner TEXT NOT NULL DEFAULT '',
+    lease_expires REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (scope, request_id)
 );
 CREATE TABLE IF NOT EXISTS adjudications (
@@ -75,13 +98,37 @@ class Store:
             except sqlite3.OperationalError:
                 if attempt == 29:
                     raise
-                import time
-
                 time.sleep(0.5)
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        self._migrate_idempotency()
+
+    def _migrate_idempotency(self) -> None:
+        """Add claim columns to databases created by older versions."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(idempotency)")}
+        additions = (
+            ("state", "ALTER TABLE idempotency ADD COLUMN state"
+                      " TEXT NOT NULL DEFAULT 'done'"),
+            ("owner", "ALTER TABLE idempotency ADD COLUMN owner"
+                      " TEXT NOT NULL DEFAULT ''"),
+            ("lease_expires", "ALTER TABLE idempotency ADD COLUMN lease_expires"
+                              " REAL NOT NULL DEFAULT 0"),
+        )
+        for col, ddl in additions:
+            if col in cols:
+                continue
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                # A concurrently starting instance may have added it.
+                self._conn.rollback()
+                cols = {r[1] for r in self._conn.execute(
+                    "PRAGMA table_info(idempotency)")}
+                if col not in cols:
+                    raise
 
     def close(self):
         self._conn.close()
@@ -127,40 +174,114 @@ class Store:
 
     # ---------------------------------------------------------- idempotency
     def idempotent(self, scope: str, request_id: str, normalized: dict):
-        """Context manager helper returning (replay, saved row writer).
+        """Claim ``(scope, request_id)`` before any domain write.
 
-        Usage::
+        Returns a context manager::
 
-            replay, save = store.idempotent("seal:SET", rid, norm)
-            if replay: return replay
-            ... do work ...
-            save(status_code, response_dict)
+            with store.idempotent("seal:SET", rid, norm) as claim:
+                if claim.replay is not None:       # completed earlier
+                    return claim.replay
+                ... do domain work ...             # exactly one instance
+                claim.save(set_id, 200, response)  # publishes the replay
+
+        Entering blocks until this caller owns the claim or a stored
+        response can be replayed. The same id submitted with different
+        normalized content raises :class:`ConflictError` before any domain
+        write happens. A pending claim whose owner crashed is taken over
+        once its lease expires, so retries are never blocked permanently.
         """
-        norm_digest = canonical.sha256_hex(normalized)
+        return _IdempotencyClaim(self, scope, request_id,
+                                 canonical.sha256_hex(normalized))
+
+    def _claim_once(self, scope: str, request_id: str, norm_digest: str):
+        """One atomic claim attempt; returns ``(outcome, payload)`` with
+        outcome ``owned`` (payload = claim token), ``replay`` (payload =
+        stored response) or ``wait`` (another instance holds a live claim).
+        """
+        now = time.time()
+        token = uuid.uuid4().hex
         with self._lock:
-            row = self._conn.execute(
-                "SELECT status_code, response_json, normalized_digest FROM idempotency"
-                " WHERE scope=? AND request_id=?", (scope, request_id)).fetchone()
-        if row is not None:
-            if row["normalized_digest"] != norm_digest:
-                raise ConflictError(
-                    "request id reused with different normalized content",
-                    {"existing_normalized_digest": row["normalized_digest"],
-                     "submitted_normalized_digest": norm_digest})
-            return {"status_code": row["status_code"],
-                    "body": json.loads(row["response_json"])}, None
-
-        def save(set_id: str, status_code: int, response: dict):
-            with self._lock:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO idempotency(scope, request_id, set_id,"
-                    " normalized_digest, status_code, response_json)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (scope, request_id, set_id, norm_digest, status_code,
-                     canonical.dumps(response).decode("utf-8")))
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT normalized_digest, status_code, response_json,"
+                    " state, lease_expires FROM idempotency"
+                    " WHERE scope=? AND request_id=?",
+                    (scope, request_id)).fetchone()
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO idempotency(scope, request_id, set_id,"
+                        " normalized_digest, status_code, response_json,"
+                        " state, owner, lease_expires)"
+                        " VALUES (?,?,?,?,-1,'','pending',?,?)",
+                        (scope, request_id, "", norm_digest, token,
+                         now + IDEMPOTENCY_LEASE_SECONDS))
+                    self._conn.commit()
+                    return "owned", token
+                if row["normalized_digest"] != norm_digest:
+                    self._conn.commit()
+                    raise ConflictError(
+                        "request id reused with different normalized content",
+                        {"existing_normalized_digest": row["normalized_digest"],
+                         "submitted_normalized_digest": norm_digest})
+                if row["state"] == "done":
+                    payload = {"status_code": row["status_code"],
+                               "body": json.loads(row["response_json"])}
+                    self._conn.commit()
+                    return "replay", payload
+                if row["lease_expires"] <= now:
+                    # The owner crashed or froze: take the claim over. Only
+                    # identical content can reach this branch, and domain
+                    # operations are deterministic for identical normalized
+                    # content, so the takeover converges on one result.
+                    cur = self._conn.execute(
+                        "UPDATE idempotency SET owner=?, lease_expires=?"
+                        " WHERE scope=? AND request_id=? AND state='pending'"
+                        " AND lease_expires<=?",
+                        (token, now + IDEMPOTENCY_LEASE_SECONDS,
+                         scope, request_id, now))
+                    self._conn.commit()
+                    if cur.rowcount == 1:
+                        return "owned", token
+                    return "wait", None  # another waiter stole it first
                 self._conn.commit()
+                return "wait", None
+            except Exception:
+                self._conn.rollback()
+                raise
 
-        return None, save
+    def _extend_lease(self, scope: str, request_id: str, token: str,
+                      lease_seconds: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE idempotency SET lease_expires=?"
+                " WHERE scope=? AND request_id=? AND owner=? AND state='pending'",
+                (time.time() + lease_seconds, scope, request_id, token))
+            self._conn.commit()
+
+    def _complete_claim(self, scope: str, request_id: str, token: str,
+                        set_id: str, status_code: int, response: dict) -> None:
+        """Publish the response. Token-conditional: if the claim was lost
+        (lease expired while this instance was frozen), the takeover request
+        persists the identical deterministic response instead."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE idempotency SET state='done', set_id=?, status_code=?,"
+                " response_json=?, lease_expires=0"
+                " WHERE scope=? AND request_id=? AND owner=? AND state='pending'",
+                (set_id, status_code, canonical.dumps(response).decode("utf-8"),
+                 scope, request_id, token))
+            self._conn.commit()
+
+    def _release_claim(self, scope: str, request_id: str, token: str) -> None:
+        """Drop a pending claim whose domain work failed. Nothing was
+        persisted, so no replay semantics exist for the id yet."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM idempotency WHERE scope=? AND request_id=?"
+                " AND owner=? AND state='pending'",
+                (scope, request_id, token))
+            self._conn.commit()
 
     # -------------------------------------------------------------- sets
     def create_set(self, set_id: str, request_id: str | None) -> bool:
@@ -356,3 +477,71 @@ class Store:
         if row is None:
             raise NotFoundError(f"adjudication {adj_id} not found")
         return row
+
+
+class _IdempotencyClaim:
+    """Context manager backing :meth:`Store.idempotent`.
+
+    Exactly one instance owns a ``(scope, request_id)`` claim at a time.
+    While owned, a heartbeat thread keeps the lease fresh so long-running
+    adjudications are not stolen; if the process dies, the lease expires
+    and a later identical request takes over.
+    """
+
+    def __init__(self, store: Store, scope: str, request_id: str,
+                 norm_digest: str):
+        self._store = store
+        self._scope = scope
+        self._request_id = request_id
+        self._digest = norm_digest
+        self.replay: dict | None = None
+        self._token: str | None = None
+        self._saved = False
+        self._stop = threading.Event()
+
+    def __enter__(self) -> "_IdempotencyClaim":
+        deadline = time.monotonic() + IDEMPOTENCY_MAX_WAIT_SECONDS
+        while True:
+            outcome, payload = self._store._claim_once(
+                self._scope, self._request_id, self._digest)
+            if outcome == "owned":
+                self._token = payload
+                threading.Thread(target=self._heartbeat, daemon=True).start()
+                return self
+            if outcome == "replay":
+                self.replay = payload
+                return self
+            # Another instance holds a live claim with identical content:
+            # wait for it to publish the response, then replay it.
+            if time.monotonic() >= deadline:
+                raise ConflictError(
+                    "request id is still being processed by another instance")
+            time.sleep(IDEMPOTENCY_POLL_SECONDS)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._token is not None and not self._saved:
+            # Domain work raised (or save was never reached): release the
+            # claim so a retry is not blocked. Nothing was persisted, so no
+            # replay semantics have been established for this id yet.
+            self._store._release_claim(self._scope, self._request_id,
+                                       self._token)
+        self._stop.set()
+        return False
+
+    def save(self, set_id: str, status_code: int, response: dict) -> None:
+        """Publish the response that future identical requests replay."""
+        if self._token is None:
+            raise RuntimeError("cannot save without owning the claim")
+        self._store._complete_claim(self._scope, self._request_id,
+                                    self._token, set_id, status_code, response)
+        self._saved = True
+        self._stop.set()
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(IDEMPOTENCY_HEARTBEAT_SECONDS):
+            try:
+                self._store._extend_lease(self._scope, self._request_id,
+                                          self._token,
+                                          IDEMPOTENCY_LEASE_SECONDS)
+            except Exception:  # noqa: BLE001 - best effort; save is conditional
+                pass
