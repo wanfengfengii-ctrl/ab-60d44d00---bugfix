@@ -1,0 +1,55 @@
+services:
+  api1:
+    build: .
+    environment:
+      API_PORT: "8080"
+      DATA_DIR: /data
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - forensic-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  api2:
+    build: .
+    environment:
+      API_PORT: "8080"
+      DATA_DIR: /data
+    # Second instance shares the SAME persistent volume to validate
+    # cross-instance concurrency / immutability semantics. It is not
+    # published on the host (api1 is the single host-mapped entry point).
+    volumes:
+      - forensic-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    # One-shot acceptance service: runs and exits.
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    environment:
+      API1_URL: http://api1:8080
+      API2_URL: http://api2:8080
+    # No volume mount and no network reliance beyond the compose network to
+    # the two APIs; the package re-verification itself is fully offline.
+    command: ["python", "acceptance/run_acceptance.py"]
+    profiles: ["verify"]
+    restart: "no"
+
+volumes:
+  forensic-data:
