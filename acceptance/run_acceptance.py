@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,6 +34,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 
 from tests import pki_factory as pf
+from app import canonical
+from app.adjudge import normalize_request
 from app.certmodel import fp_of
 from verify.verify_package import verify_package
 
@@ -249,6 +252,182 @@ def main() -> int:
                    json=uadj)
     check("out-of-profile P-384 -> structured UNSUPPORTED",
           r.status_code == 422 and r.json()["error"]["code"] == "UNSUPPORTED")
+
+    # ============================================================
+    # Cross-instance concurrent idempotency: two requests carrying the
+    # same (scope, client_request_id) hit api1 and api2 at the same
+    # instant. Identical content must converge on one replayable result;
+    # different content must conflict before any business write; the
+    # persisted state must never carry a second, orphan result.
+    # ============================================================
+    def race_posts(path, body1, body2=None):
+        """POST body1 -> API1 and body2 (default: body1) -> API2 released
+        at the same instant; returns the two responses (api1 first)."""
+        body2 = body1 if body2 is None else body2
+        out: dict[int, httpx.Response] = {}
+        barrier = threading.Barrier(2)
+
+        def hit(idx, base, body):
+            barrier.wait(10.0)
+            out[idx] = httpx.post(base + path, json=body, timeout=30)
+
+        t1 = threading.Thread(target=hit, args=(0, API1, body1))
+        t2 = threading.Thread(target=hit, args=(1, API2, body2))
+        t1.start(); t2.start(); t1.join(35); t2.join(35)
+        assert not t1.is_alive() and not t2.is_alive(), "race requests hung"
+        return out[0], out[1]
+
+    # ---- create: identical content, fired at both instances ----------
+    r1, r2 = race_posts("/api/v1/evidence-sets",
+                        {"client_request_id": "race-create-same", "note": "n"})
+    same_ok = (r1.status_code == 201 and r2.status_code == 201
+               and r1.content == r2.content
+               and r1.json()["evidence_set_id"] == r2.json()["evidence_set_id"])
+    check("concurrent create same content -> one set", same_ok,
+          f"{r1.status_code}/{r2.status_code}")
+    race_sid = r1.json()["evidence_set_id"] if same_ok else None
+
+    # ---- create: different content must split 201 / 409 --------------
+    r1, r2 = race_posts(
+        "/api/v1/evidence-sets",
+        {"client_request_id": "race-create-diff", "note": "alpha"},
+        {"client_request_id": "race-create-diff", "note": "beta"})
+    diff_codes = sorted([r1.status_code, r2.status_code])
+    create_diff_ok = diff_codes == [201, 409]
+    check("concurrent create different content -> 201 + 409",
+          create_diff_ok, f"{r1.status_code}/{r2.status_code}")
+    if create_diff_ok:
+        winner = r1 if r1.status_code == 201 else r2
+        # The losing note's deterministically derived set id never exists.
+        import json as _json
+        winning_note = _json.loads(winner.request.content)["note"]
+        loser_note = "beta" if winning_note == "alpha" else "alpha"
+        loser_norm = {"op": "create_evidence_set",
+                      "client_request_id": "race-create-diff",
+                      "note": loser_note}
+        loser_sid = "es_" + canonical.sha256_hex(loser_norm)[:32]
+        gone = httpx.get(f"{API1}/api/v1/evidence-sets/{loser_sid}")
+        check("losing create content produced no evidence set",
+              gone.status_code == 404)
+        # The conflict is stable across retries on either instance.
+        again = httpx.post(API2 + "/api/v1/evidence-sets",
+                           json={"client_request_id": "race-create-diff",
+                                 "note": loser_note})
+        check("create conflict is stable on retry", again.status_code == 409)
+
+    # ---- upload: identical and divergent content ---------------------
+    if race_sid:
+        rrk, rck, rlk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+        rroot = pf.build_cert("Race Root", None, rrk, rrk, is_ca=True,
+                              key_usage=("keyCertSign", "cRLSign"),
+                              policies=[ANY], self_signed=True)
+        rca = pf.build_cert("Race CA", rroot, rck, rrk, is_ca=True,
+                            key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+        rleaf = pf.build_cert("race.test", rca, rlk, rck,
+                              key_usage=("digitalSignature",),
+                              eku=("codeSigning",), policies=[ANY],
+                              san_dns=("race.test",))
+        rcrl = pf.build_crl(rroot, rrk, [], last_update=SIGNED - 100,
+                            next_update=SIGNED + 100, crl_number=1)
+        cacrl = pf.build_crl(rca, rck, [], last_update=SIGNED - 100,
+                             next_update=SIGNED + 100, crl_number=1)
+        race_certs = [("root", rroot), ("ca", rca), ("leaf", rleaf)]
+        up_same = {"client_request_id": "race-up-same", "received_at": RECEIVED,
+                   "items": [{"client_ref": ref, "type": "certificate",
+                              "content_base64": b64(c)}
+                             for ref, c in race_certs]
+                   + [{"client_ref": "rcrl", "type": "crl",
+                       "content_base64": b64(rcrl)},
+                      {"client_ref": "cacrl", "type": "crl",
+                       "content_base64": b64(cacrl)}]}
+        u1, u2 = race_posts(
+            f"/api/v1/evidence-sets/{race_sid}/items", up_same)
+        check("concurrent upload same content -> one replay",
+              u1.status_code == 200 and u2.status_code == 200
+              and u1.content == u2.content and u1.json()["accepted"] == 5,
+              f"{u1.status_code}/{u2.status_code}")
+
+        # Same request id on a FRESH set, but the one item carries
+        # different bytes: exactly one request may perform the write.
+        diff_set_r = httpx.post(
+            API1 + "/api/v1/evidence-sets",
+            json={"client_request_id": "race-up-diff-set"})
+        diff_sid = diff_set_r.json()["evidence_set_id"]
+        alt_key = pf.gen_key()
+        alt_leaf = pf.build_cert("race-alt.test", rca, alt_key, rck,
+                                 key_usage=("digitalSignature",),
+                                 eku=("codeSigning",), policies=[ANY],
+                                 san_dns=("race-alt.test",))
+        up_a = {"client_request_id": "race-up-diff", "received_at": RECEIVED,
+                "items": [{"client_ref": "probe", "type": "certificate",
+                           "content_base64": b64(rleaf)}]}
+        up_b = {"client_request_id": "race-up-diff", "received_at": RECEIVED,
+                "items": [{"client_ref": "probe", "type": "certificate",
+                           "content_base64": b64(alt_leaf)}]}
+        d1, d2 = race_posts(
+            f"/api/v1/evidence-sets/{diff_sid}/items", up_a, up_b)
+        check("concurrent upload different content -> 200 + 409",
+              sorted([d1.status_code, d2.status_code]) == [200, 409],
+              f"{d1.status_code}/{d2.status_code}")
+        # Seal the divergent-upload set on the OTHER instance and confirm
+        # only the winner's single certificate ever landed.
+        dseal = httpx.post(f"{API2}/api/v1/evidence-sets/{diff_sid}/seal",
+                           json={"client_request_id": "race-up-diff-seal"})
+        check("losing upload content never persisted",
+              dseal.status_code == 200
+              and dseal.json()["manifest"]["counts"]["certificates"] == 1)
+
+        s1 = httpx.post(f"{API1}/api/v1/evidence-sets/{race_sid}/seal",
+                        json={"client_request_id": "race-seal"})
+        check("race set seals", s1.status_code == 200)
+        manifest = s1.json()["manifest"] if s1.status_code == 200 else None
+        # Exactly root/ca/leaf persisted once; the losing leaf never landed.
+        check("no extra certificate from losing upload",
+              manifest is not None
+              and manifest["counts"]["certificates"] == 3
+              and manifest["counts"]["crls"] == 2)
+
+        # ---- adjudication: identical and divergent content -------------
+        art = hashlib.sha256(b"race-artifact").digest()
+        race_adj = {"client_request_id": "race-adj-same",
+                    "artifact_digest": art.hex(),
+                    "signature": rlk.sign(
+                        art, ec.ECDSA(Prehashed(hashes.SHA256()))).hex(),
+                    "signature_algorithm": "1.2.840.10045.4.3.2",
+                    "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+                    "leaf_certificate_sha256": fp_of(pf.der(rleaf)),
+                    "initial_policies": [ANY],
+                    "trust_anchors": [fp_of(pf.der(rroot))]}
+        a1, a2 = race_posts(
+            f"/api/v1/evidence-sets/{race_sid}/adjudications", race_adj)
+        adj_same_ok = (a1.status_code == 201 and a2.status_code == 201
+                       and a1.content == a2.content
+                       and a1.json()["adjudication_id"]
+                       == a2.json()["adjudication_id"]
+                       and a1.json()["verdict"]["status"] == "VALID")
+        check("concurrent adjudication same content -> unique replay",
+              adj_same_ok, f"{a1.status_code}/{a2.status_code}")
+
+        art2 = hashlib.sha256(b"race-artifact-2").digest()
+        adj_a = dict(race_adj, client_request_id="race-adj-diff",
+                     artifact_digest=art2.hex(),
+                     signature=rlk.sign(
+                         art2, ec.ECDSA(Prehashed(hashes.SHA256()))).hex(),
+                     knowledge_cutoff=CUTOFF)
+        adj_b = dict(adj_a, knowledge_cutoff=CUTOFF + 1)
+        z1, z2 = race_posts(
+            f"/api/v1/evidence-sets/{race_sid}/adjudications", adj_a, adj_b)
+        check("concurrent adjudication different content -> 201 + 409",
+              sorted([z1.status_code, z2.status_code]) == [201, 409],
+              f"{z1.status_code}/{z2.status_code}")
+        # The losing adjudication's content-addressed id must not exist.
+        losing_body = adj_b if z1.status_code == 201 else adj_a
+        losing_digest = canonical.sha256_hex(normalize_request(losing_body))
+        gone_adj = httpx.get(
+            f"{API1}/api/v1/evidence-sets/{race_sid}/adjudications/"
+            f"{losing_digest}")
+        check("losing adjudication produced no persisted result",
+              gone_adj.status_code == 404)
 
     print("-" * 64)
     failed = [x for x in results if x[0] == FAIL]

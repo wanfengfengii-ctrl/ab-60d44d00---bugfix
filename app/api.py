@@ -30,6 +30,7 @@ from . import canonical
 from .adjudge import adjudicate, normalize_request
 from .errors import (
     ConflictError,
+    InflightTimeoutError,
     MalformedEvidenceError,
     NotFoundError,
     ProfileError,
@@ -76,6 +77,14 @@ def create_app(store: Store) -> FastAPI:
                                  content={"error": {"code": "NOT_FOUND",
                                                     "message": str(exc)}})
 
+    @app.exception_handler(InflightTimeoutError)
+    async def _inflight_exc(request: Request, exc: InflightTimeoutError):
+        return CanonicalResponse(
+            status_code=503,
+            headers={"Retry-After": "5"},
+            content={"error": {"code": "REQUEST_INFLIGHT",
+                               "message": str(exc), "detail": exc.detail}})
+
     @app.get("/healthz")
     async def healthz():
         return CanonicalResponse(
@@ -90,15 +99,19 @@ def create_app(store: Store) -> FastAPI:
             raise MalformedEvidenceError("client_request_id is required")
         norm = {"op": "create_evidence_set", "client_request_id": rid,
                 "note": body.get("note", "")}
-        replay, save = store.idempotent("create_set", rid, norm)
+        replay, claim = store.idempotent("create_set", rid, norm)
         if replay:
             return CanonicalResponse(status_code=replay["status_code"],
                                     content=replay["body"])
         set_id = "es_" + canonical.sha256_hex(norm)[:32]
-        store.create_set(set_id, rid)
-        resp = {"evidence_set_id": set_id, "state": "open",
-                "client_request_id": rid}
-        save(set_id, 201, resp)
+        try:
+            store.create_set(set_id, rid)
+            resp = {"evidence_set_id": set_id, "state": "open",
+                    "client_request_id": rid}
+        except BaseException:
+            claim.abandon()
+            raise
+        claim.complete(set_id, 201, resp)
         return CanonicalResponse(status_code=201, content=resp)
 
     @app.post("/api/v1/evidence-sets/{set_id}/items")
@@ -142,26 +155,30 @@ def create_app(store: Store) -> FastAPI:
         norm = {"op": "add_items", "evidence_set_id": set_id,
                 "client_request_id": rid, "received_at": received_at,
                 "items": norm_items}
-        replay, save = store.idempotent(f"items:{set_id}", rid, norm)
+        replay, claim = store.idempotent(f"items:{set_id}", rid, norm)
         if replay:
             return CanonicalResponse(status_code=replay["status_code"],
                                     content=replay["body"])
 
         # Persist blobs (content dedup is inherently idempotent).
-        rows = []
-        for p in prepared:
-            store.put_blob(p["raw"])
-            rows.append({"client_ref": p["client_ref"], "kind": p["kind"],
-                         "content_sha256": p["content_sha256"],
-                         "received_at": p["received_at"]})
-        store.assert_open(set_id)
-        store.add_items(set_id, rows)
+        try:
+            rows = []
+            for p in prepared:
+                store.put_blob(p["raw"])
+                rows.append({"client_ref": p["client_ref"], "kind": p["kind"],
+                             "content_sha256": p["content_sha256"],
+                             "received_at": p["received_at"]})
+            store.assert_open(set_id)
+            store.add_items(set_id, rows)
+        except BaseException:
+            claim.abandon()
+            raise
         accepted = [{"client_ref": p["client_ref"], "type": p["kind"],
                      "sha256": p["content_sha256"]} for p in prepared]
         accepted.sort(key=lambda x: x["client_ref"])
         resp = {"evidence_set_id": set_id, "accepted": len(rows),
                 "items": accepted, "client_request_id": rid}
-        save(set_id, 200, resp)
+        claim.complete(set_id, 200, resp)
         return resp
 
     @app.post("/api/v1/evidence-sets/{set_id}/seal")
@@ -174,14 +191,18 @@ def create_app(store: Store) -> FastAPI:
             raise MalformedEvidenceError("client_request_id is required")
         norm = {"op": "seal", "evidence_set_id": set_id,
                 "client_request_id": rid}
-        replay, save = store.idempotent(f"seal:{set_id}", rid, norm)
+        replay, claim = store.idempotent(f"seal:{set_id}", rid, norm)
         if replay:
             return CanonicalResponse(status_code=replay["status_code"],
                                     content=replay["body"])
-        manifest = store.seal(set_id)
+        try:
+            manifest = store.seal(set_id)
+        except BaseException:
+            claim.abandon()
+            raise
         resp = {"evidence_set_id": set_id, "state": "sealed",
                 "manifest": manifest, "client_request_id": rid}
-        save(set_id, 200, resp)
+        claim.complete(set_id, 200, resp)
         return resp
 
     @app.get("/api/v1/evidence-sets/{set_id}")
@@ -203,15 +224,19 @@ def create_app(store: Store) -> FastAPI:
         req_norm = normalize_request(body)
         norm = {"op": "adjudicate", "evidence_set_id": set_id,
                 "client_request_id": rid, "request": req_norm}
-        replay, _save = store.idempotent(f"adjudicate:{set_id}", rid, norm)
+        replay, claim = store.idempotent(f"adjudicate:{set_id}", rid, norm)
         if replay:
             return CanonicalResponse(status_code=replay["status_code"],
                                     content=replay["body"])
-        result = adjudicate(store, set_id, body)
+        try:
+            result = adjudicate(store, set_id, body)
+        except BaseException:
+            claim.abandon()
+            raise
         adj_id = result["adjudication"]["request_digest"]
         out = {"adjudication_id": adj_id, **result}
-        # Persist the idempotency replay row pointing at the same content.
-        _save(set_id, 201, out)
+        # Publish the one replay row for this request id.
+        claim.complete(set_id, 201, out)
         return CanonicalResponse(status_code=201, content=out)
 
     @app.get("/api/v1/evidence-sets/{set_id}/adjudications/{adj_id}")

@@ -20,7 +20,7 @@ docker compose up -d api1 api2
 
 # 运行一次性验收服务（容器名 verify），跑完即退出
 docker compose run --build verify
-# 期望最后一行：acceptance: 14/14 passed
+# 期望最后一行：acceptance: 26/26 passed
 ```
 
 - 健康检查：`curl -fsS http://127.0.0.1:${API_PORT}/healthz`
@@ -284,8 +284,16 @@ python -m verify path/to/<adjudication_id>.zip --json   # 机器读
   （临时文件 + `fsync` + 原子 rename）。
 - 所有状态变更在 `BEGIN IMMEDIATE` 事务内完成；两个实例/两个线程同时封存
   只会得到同一份不可变清单。
-- 幂等表以 `(scope, client_request_id)` 为主键，记录规范化摘要与响应；
-  裁决另以规范化请求摘要内容寻址去重。
+- 幂等表以 `(scope, client_request_id)` 为主键，记录规范化摘要与响应。
+  请求在**任何领域写入之前**先在一个写事务中插入 `inflight` 归属标记：
+  - 相同内容的竞争请求阻塞等待，处理完成后重放**同一个**响应；
+  - 不同内容的后到请求稳定返回 `409`，不产生任何业务结果；
+  - 持锁实例崩溃/被杀后心跳停止，租约（默认 600s）到期即由相同内容的
+    重试接管（`owner_token` 会把迟到的旧持锁者完成动作挡掉），因此
+    重试既不会永久阻塞，也不可能产生第二份结果。
+  - 等待方在极长处理链下的兜底超时返回 `503 REQUEST_INFLIGHT`
+    （带 `Retry-After`），属可安全重试的临时状态。
+- 裁决另以规范化请求摘要内容寻址去重。
 
 ---
 

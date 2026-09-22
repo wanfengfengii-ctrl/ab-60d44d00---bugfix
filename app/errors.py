@@ -33,6 +33,15 @@ class ConflictError(Exception):
         self.existing = existing or {}
 
 
+class InflightTimeoutError(Exception):
+    """An identical request is still in flight on another instance and its
+    lease chain never settled within the waiter's bound."""
+
+    def __init__(self, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.detail = detail or {}
+
+
 class NotFoundError(Exception):
     pass
 
